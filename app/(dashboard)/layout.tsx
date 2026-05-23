@@ -19,7 +19,7 @@ export default async function DashboardLayout({
 
   return (
     <div className="min-h-screen flex bg-gray-100 dark:bg-gray-950">
-      <aside className="w-64 bg-white dark:bg-gray-900 border-r border-gray-200 dark:border-gray-800 flex flex-col shrink-0">
+      <aside className="w-64 h-screen sticky top-0 bg-white dark:bg-gray-900 border-r border-gray-200 dark:border-gray-800 flex flex-col shrink-0">
         <div className="p-6 border-b border-gray-200 dark:border-gray-800">
           <h1 className="text-xl font-bold text-gray-900 dark:text-white">
             Mini AI HR
