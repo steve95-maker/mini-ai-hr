@@ -54,7 +54,7 @@ const tools: OpenAI.ChatCompletionTool[] = [
     type: 'function',
     function: {
       name: 'find_employee',
-      description: 'Find an employee by name or email. Returns full employee details including ID. Use this before any update/deactivate operation.',
+      description: 'Find an employee by name or email. Returns full employee details including ID.',
       parameters: {
         type: 'object',
         properties: {
@@ -94,7 +94,7 @@ const tools: OpenAI.ChatCompletionTool[] = [
     type: 'function',
     function: {
       name: 'deactivate_employee',
-      description: 'Deactivate an employee (set status to inactive). Must find employee first to get ID.',
+      description: 'Deactivate an employee (set status to inactive). Reversible. Must find employee first to get ID.',
       parameters: {
         type: 'object',
         properties: {
@@ -109,6 +109,20 @@ const tools: OpenAI.ChatCompletionTool[] = [
     function: {
       name: 'activate_employee',
       description: 'Re-activate a deactivated employee. Must find employee first to get ID.',
+      parameters: {
+        type: 'object',
+        properties: {
+          id: { type: 'string', description: "Employee's UUID" },
+        },
+        required: ['id'],
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'delete_employee',
+      description: 'PERMANENTLY DELETE an employee from the database. This is destructive and CANNOT be undone. ALWAYS confirm with the user before calling this. Prefer deactivate_employee for most removals.',
       parameters: {
         type: 'object',
         properties: {
@@ -238,6 +252,15 @@ async function executeTool(
       return { success: true, employee: data }
     }
 
+    case 'delete_employee': {
+      const { error } = await supabase
+        .from('employees')
+        .delete()
+        .eq('id', args.id as string)
+      if (error) return { error: error.message }
+      return { success: true, message: 'Employee permanently deleted.' }
+    }
+
     case 'generate_employee_summary': {
       const { data: employee, error } = await supabase
         .from('employees')
@@ -275,6 +298,7 @@ async function executeTool(
   }
 }
 
+// POST: handle a new chat message (creates a session if none provided)
 export async function POST(request: NextRequest) {
   const supabase = await createClient()
   const { data: { user } } = await supabase.auth.getUser()
@@ -283,7 +307,22 @@ export async function POST(request: NextRequest) {
     return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
   }
 
-  const { messages } = await request.json()
+  const { messages, sessionId: providedSessionId } = await request.json()
+  const lastUserMessage = messages[messages.length - 1]
+
+  // Ensure we have a session
+  let sessionId: string = providedSessionId
+  if (!sessionId) {
+    const { data: newSession, error: sessionError } = await supabase
+      .from('chat_sessions')
+      .insert({ user_id: user.id, title: 'New Chat' })
+      .select()
+      .single()
+    if (sessionError || !newSession) {
+      return NextResponse.json({ error: 'Failed to create session' }, { status: 500 })
+    }
+    sessionId = newSession.id
+  }
 
   const systemPrompt = `You are an AI HR Assistant for the Mini AI HR system. You help HR admins manage employee records through natural language.
 
@@ -292,18 +331,20 @@ You have access to tools for:
 - Listing employees (with optional active/inactive filter)
 - Finding employees by name or email
 - Updating employee details
-- Deactivating/activating employees
+- Deactivating/activating employees (reversible)
+- Permanently deleting employees (destructive, irreversible)
 - Generating professional HR summaries
 
 IMPORTANT GUIDELINES:
-- For update, deactivate, activate, or summary actions, ALWAYS use find_employee first to get the employee ID.
+- For update, deactivate, activate, summary, or delete actions, ALWAYS use find_employee first to get the employee ID.
+- For delete_employee, ALWAYS ask the user to confirm before calling it. Only call delete_employee after explicit confirmation.
+- If user says just "remove" or "delete" without saying "permanently", clarify whether they want to deactivate (reversible) or delete (permanent).
 - If required info is missing (e.g. creating an employee without a name or email), ASK the user for it rather than guessing.
 - Be friendly, concise, and professional.
 - After performing an action, briefly confirm what you did.
 - For dates, use YYYY-MM-DD format.
 - When listing employees, present them as a clean markdown list with bullet points.
 - Use markdown formatting: **bold** for names, bullet points for lists, line breaks between sections.
-- Keep responses well-organized and easy to scan.
 
 Current HR admin: ${user.email}
 Today's date: ${new Date().toISOString().split('T')[0]}`
@@ -314,6 +355,8 @@ Today's date: ${new Date().toISOString().split('T')[0]}`
   ]
 
   const maxIterations = 5
+  let assistantContent = ''
+
   for (let i = 0; i < maxIterations; i++) {
     const completion = await openai.chat.completions.create({
       model: 'gpt-4o-mini',
@@ -326,7 +369,8 @@ Today's date: ${new Date().toISOString().split('T')[0]}`
     chatMessages.push(message)
 
     if (!message.tool_calls || message.tool_calls.length === 0) {
-      return NextResponse.json({ message: message.content })
+      assistantContent = message.content ?? ''
+      break
     }
 
     for (const toolCall of message.tool_calls) {
@@ -341,7 +385,57 @@ Today's date: ${new Date().toISOString().split('T')[0]}`
     }
   }
 
-  return NextResponse.json({
-    message: "I'm having trouble completing that — could you try rephrasing?",
-  })
+  if (!assistantContent) {
+    assistantContent = "I'm having trouble completing that — could you try rephrasing?"
+  }
+
+  // Save messages to this session
+  await supabase.from('chat_messages').insert([
+    { user_id: user.id, session_id: sessionId, role: 'user', content: lastUserMessage.content },
+    { user_id: user.id, session_id: sessionId, role: 'assistant', content: assistantContent },
+  ])
+
+  // Update session: set title from first user message if still default; bump updated_at
+  const { data: session } = await supabase
+    .from('chat_sessions')
+    .select('title')
+    .eq('id', sessionId)
+    .single()
+
+  const updates: Record<string, unknown> = { updated_at: new Date().toISOString() }
+  if (session?.title === 'New Chat') {
+    const trimmed = lastUserMessage.content.slice(0, 60)
+    updates.title = lastUserMessage.content.length > 60 ? trimmed + '…' : trimmed
+  }
+  await supabase.from('chat_sessions').update(updates).eq('id', sessionId)
+
+  return NextResponse.json({ message: assistantContent, sessionId })
+}
+
+// GET: fetch messages for a specific session
+export async function GET(request: NextRequest) {
+  const supabase = await createClient()
+  const { data: { user } } = await supabase.auth.getUser()
+
+  if (!user) {
+    return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
+  }
+
+  const sessionId = request.nextUrl.searchParams.get('sessionId')
+  if (!sessionId) {
+    return NextResponse.json({ messages: [] })
+  }
+
+  const { data, error } = await supabase
+    .from('chat_messages')
+    .select('role, content')
+    .eq('session_id', sessionId)
+    .eq('user_id', user.id)
+    .order('created_at', { ascending: true })
+
+  if (error) {
+    return NextResponse.json({ error: error.message }, { status: 500 })
+  }
+
+  return NextResponse.json({ messages: data ?? [] })
 }
